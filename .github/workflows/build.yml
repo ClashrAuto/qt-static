@@ -2,6 +2,11 @@ name: Build static Qt
 
 # 编出 Coast 用的静态 Qt，发成**本仓库**的 release 资产。
 #
+# 注：2026-08-08 clashauto 的静态 Qt 改动合入 master 之前，本 workflow 拉到的是旧版 action
+# （没有 complete 输出、Windows 脚本也没有 Ninja 修复）。表现极具迷惑性：三套 Qt 都**编译成功**、
+# job 全绿，但 Publish 一律 skipped —— 因为 `steps.qt.outputs.complete` 在旧 action 里根本不存在，
+# 空值 != 'true'。白编了一整轮。ref 指向 master 时要记得：master 上的 action 才是实际执行的那份。
+#
 # ★ 为什么构建放在这边、而不是 clashauto 那边：
 #   反过来做（clashauto 编好再跨仓库写过来）需要一个对本仓库有 contents:write 的 PAT，
 #   得有人去建、去存成 secret、到期还要轮换。放在本仓库里，用 Actions 自带的 GITHUB_TOKEN
