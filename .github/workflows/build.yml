@@ -34,9 +34,12 @@ on:
   workflow_dispatch:
     inputs:
       qt-version:
-        description: Qt 版本（须与 clashauto 的 QT_VERSION 一致）
+        description: >-
+          Qt 版本。**留空 = 按平台取默认值**（见矩阵里的 qt:）——Windows/macOS 6.11.1、
+          Linux 6.8.3，与 clashauto 的 QT_VERSION / QT_VERSION_LINUX 一一对应。
+          填了就五套一起用这个值，只在临时试某个版本时才该填。
         required: false
-        default: '6.8.3'
+        default: ''
       targets:
         description: 只编哪几套（逗号分隔，留空 = 全部五套）
         required: false
@@ -59,16 +62,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # qt: 与 clashauto 的 release.yml 必须一一对应（Windows/macOS 用 QT_VERSION，
+          # Linux 用 QT_VERSION_LINUX）。对不上不会报错 —— 只会让那边永远找不到预编产物，
+          # 每次发布都从源码编一遍。
           - target: windows-x64
             runner: windows-2022
+            qt: 6.11.1
           - target: windows-arm64
             runner: windows-2022
+            qt: 6.11.1
           - target: linux-x64
             runner: ubuntu-22.04
+            qt: 6.8.3
           - target: linux-arm64
             runner: ubuntu-24.04-arm
+            qt: 6.8.3
           - target: macos-universal
             runner: macos-14
+            qt: 6.11.1
     timeout-minutes: 350
 
     steps:
@@ -94,35 +105,23 @@ jobs:
           path: clashauto
           # 公开仓库，不需要 token
 
-      - name: Install host Qt (windows-arm64 交叉编译用)
-        # 交叉编 Qt 需要一份**同版本**的宿主 Qt 提供 moc/rcc/qmlcachegen。
-        # 宿主工具是编译期用的，共享构建就够。
-        if: steps.want.outputs.go == 'true' && matrix.target == 'windows-arm64'
-        shell: pwsh
-        run: |
-          $qtver = if ('${{ github.event.inputs.qt-version }}') { '${{ github.event.inputs.qt-version }}' } else { '6.8.3' }
-          python -m pip install --upgrade pip
-          python -m pip install aqtinstall
-          for ($i = 1; $i -le 3; $i++) {
-            python -m aqt install-qt windows desktop $qtver win64_msvc2022_64 -O C:\Qt
-            if ($LASTEXITCODE -eq 0) { break }
-            if ($i -eq 3) { throw "aqt 三次均失败" }
-            Start-Sleep -Seconds 10
-          }
-          $root = Get-ChildItem "C:\Qt\$qtver" -Directory |
-            Where-Object { $_.Name -notlike '*arm64*' -and (Test-Path (Join-Path $_.FullName 'bin\moc.exe')) } |
-            Select-Object -First 1 -ExpandProperty FullName
-          if (-not $root) { throw "装上的宿主 Qt 里找不到 moc.exe" }
-          "QT_HOST_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      # 宿主 Qt 那一步没了：windows-arm64 交叉编译要的同版本宿主 Qt 由 qt-static action
+      # 自己解析（取同版本同配方的 windows-x64 静态 Qt，也就是本仓库发的那个资产）。
+      # 原来用的 aqtinstall 在 6.11 上必挂 —— Qt 从 6.9 起改了在线仓库目录布局，
+      #     qt6_683/qt6_683/                  旧：一个目录装所有架构
+      #     qt6_6111/qt6_6111_msvc2022_64/    新：按架构分子目录
+      # aqt 3.3.0（PyPI 最新）仍按旧布局拼路径，报 "Failed to locate XML data"。
+      # ★ 由此多了一条**顺序**约束：windows-arm64 要能编，windows-x64 的资产得先在。
+      #   五套仍然并行、互不 needs —— arm64 没等到 x64 时会以一条明确的 ::error:: 收场，
+      #   重跑一次即可，不值得为此把矩阵串起来。
 
       - name: Build static Qt
         id: qt
         if: steps.want.outputs.go == 'true'
         uses: ./clashauto/.github/actions/qt-static
         with:
-          qt-version: ${{ github.event.inputs.qt-version || '6.8.3' }}
+          qt-version: ${{ github.event.inputs.qt-version || matrix.qt }}
           target: ${{ matrix.target }}
-          host-qt-path: ${{ matrix.target == 'windows-arm64' && env.QT_HOST_ROOT || '' }}
           # macOS 的 Qt 本身也必须是通用二进制，否则 app 那侧 -DCMAKE_OSX_ARCHITECTURES
           # 会因为链到单架构静态库而失败。部署目标要与 clashauto 的 macos job 一致。
           extra-cmake: ${{ matrix.target == 'macos-universal' && '-DCMAKE_OSX_ARCHITECTURES=x86_64;arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0' || '' }}
@@ -138,7 +137,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           QT_ROOT: ${{ steps.qt.outputs.qt-root }}
           RECIPE: ${{ steps.qt.outputs.recipe }}
-          QTVER: ${{ github.event.inputs.qt-version || '6.8.3' }}
+          QTVER: ${{ github.event.inputs.qt-version || matrix.qt }}
         run: |
           set -euo pipefail
           asset="qtstatic-${QTVER}-${{ matrix.target }}-${RECIPE}.tar.gz"
