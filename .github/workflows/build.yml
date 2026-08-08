@@ -1,0 +1,150 @@
+name: Build static Qt
+
+# 编出 Coast 用的静态 Qt，发成**本仓库**的 release 资产。
+#
+# ★ 为什么构建放在这边、而不是 clashauto 那边：
+#   反过来做（clashauto 编好再跨仓库写过来）需要一个对本仓库有 contents:write 的 PAT，
+#   得有人去建、去存成 secret、到期还要轮换。放在本仓库里，用 Actions 自带的 GITHUB_TOKEN
+#   就能发自己的 release —— **不需要任何 PAT 或 secret**，也就没有凭据过期这回事。
+#   clashauto 那边只匿名下载公开资产，同样不需要凭据。
+#
+# ★ 配方（模块集、configure flag、断点续编逻辑）**只有一份**，在 clashauto 里：
+#   .github/actions/qt-static/。本仓库 checkout 过去直接 uses: 那个复合 action，
+#   不保存任何副本 —— 两份配方迟早会漂移，而漂移的表现是「编出来的 Qt 和 app 期待的不一致」，
+#   那种问题查起来极贵。
+#
+# ★ Windows 两套一轮编不完 GitHub 的 6 小时上限，靠断点续编分几轮推进（进度存 Actions 缓存）。
+#   本 workflow **故意不设并发组**：被后一次运行取消掉的 job 跑不到回写缓存那一步，
+#   于是「边编边被取消」= 每轮都白烧、进度一次也存不下来。反复手动跑，直到出资产为止。
+
+on:
+  workflow_dispatch:
+    inputs:
+      qt-version:
+        description: Qt 版本（须与 clashauto 的 QT_VERSION 一致）
+        required: false
+        default: '6.8.3'
+      targets:
+        description: 只编哪几套（逗号分隔，留空 = 全部五套）
+        required: false
+        default: ''
+  schedule:
+    # 每周一 04:23 UTC。作用有两个：把 Windows 那两套断点续编一轮轮推完；
+    # 以及在 clashauto 改了配方（资产名里的哈希会变）之后自动补上新资产。
+    # 错开整点，避开 GitHub 定时任务高峰。
+    - cron: '23 4 * * 1'
+
+permissions:
+  contents: write   # 发布 release 资产用的就是这一条，除此之外不需要任何权限
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    # 一套挂了不该拖累其余四套：五套之间没有任何依赖，各自独立发资产。
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows-x64
+            runner: windows-2022
+          - target: windows-arm64
+            runner: windows-2022
+          - target: linux-x64
+            runner: ubuntu-22.04
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+          - target: macos-universal
+            runner: macos-14
+    timeout-minutes: 350
+
+    steps:
+      - name: 该不该编这一套
+        id: want
+        shell: bash
+        env:
+          ONLY: ${{ github.event.inputs.targets }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ONLY:-}" ]; then echo "go=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          case ",${ONLY// /}," in
+            *",${{ matrix.target }},"*) echo "go=true"  >> "$GITHUB_OUTPUT";;
+            *)                          echo "go=false" >> "$GITHUB_OUTPUT"; echo "跳过 ${{ matrix.target }}";;
+          esac
+
+      - name: Checkout clashauto（配方的唯一来源）
+        if: steps.want.outputs.go == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ClashrAuto/clashauto
+          ref: master
+          path: clashauto
+          # 公开仓库，不需要 token
+
+      - name: Install host Qt (windows-arm64 交叉编译用)
+        # 交叉编 Qt 需要一份**同版本**的宿主 Qt 提供 moc/rcc/qmlcachegen。
+        # 宿主工具是编译期用的，共享构建就够。
+        if: steps.want.outputs.go == 'true' && matrix.target == 'windows-arm64'
+        shell: pwsh
+        run: |
+          $qtver = if ('${{ github.event.inputs.qt-version }}') { '${{ github.event.inputs.qt-version }}' } else { '6.8.3' }
+          python -m pip install --upgrade pip
+          python -m pip install aqtinstall
+          for ($i = 1; $i -le 3; $i++) {
+            python -m aqt install-qt windows desktop $qtver win64_msvc2022_64 -O C:\Qt
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($i -eq 3) { throw "aqt 三次均失败" }
+            Start-Sleep -Seconds 10
+          }
+          $root = Get-ChildItem "C:\Qt\$qtver" -Directory |
+            Where-Object { $_.Name -notlike '*arm64*' -and (Test-Path (Join-Path $_.FullName 'bin\moc.exe')) } |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $root) { throw "装上的宿主 Qt 里找不到 moc.exe" }
+          "QT_HOST_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build static Qt
+        id: qt
+        if: steps.want.outputs.go == 'true'
+        uses: ./clashauto/.github/actions/qt-static
+        with:
+          qt-version: ${{ github.event.inputs.qt-version || '6.8.3' }}
+          target: ${{ matrix.target }}
+          host-qt-path: ${{ matrix.target == 'windows-arm64' && env.QT_HOST_ROOT || '' }}
+          # macOS 的 Qt 本身也必须是通用二进制，否则 app 那侧 -DCMAKE_OSX_ARCHITECTURES
+          # 会因为链到单架构静态库而失败。部署目标要与 clashauto 的 macos job 一致。
+          extra-cmake: ${{ matrix.target == 'macos-universal' && '-DCMAKE_OSX_ARCHITECTURES=x86_64;arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0' || '' }}
+          # 本仓库没有并发组，可以放心干长活 —— 这正是把构建放这边的理由之一。
+          build-deadline-min: '280'
+
+      - name: Publish
+        # 只在**这一轮真的编完**时发布。半份 Qt 传上去比没有更糟：下游会当成好东西下下来，
+        # 然后在链接期以一堆缺符号收场 —— 而那时错因离现场已经隔了好几层。
+        if: steps.want.outputs.go == 'true' && steps.qt.outputs.complete == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QT_ROOT: ${{ steps.qt.outputs.qt-root }}
+          RECIPE: ${{ steps.qt.outputs.recipe }}
+          QTVER: ${{ github.event.inputs.qt-version || '6.8.3' }}
+        run: |
+          set -euo pipefail
+          asset="qtstatic-${QTVER}-${{ matrix.target }}-${RECIPE}.tar.gz"
+          # -C "$QT_ROOT" . ：打包前缀的**内容**（含 .qtstatic-complete 这类点文件），
+          # 解包端 tar -xzf 直接铺进前缀，不多一层目录。
+          tar -czf "$RUNNER_TEMP/$asset" -C "$QT_ROOT" .
+          ls -lh "$RUNNER_TEMP/$asset"
+          tag="qt-${QTVER}"
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
+                 --title "Prebuilt static Qt $QTVER" \
+                 --notes "由本仓库的 Build static Qt 自动发布。资产名里的短哈希 = clashauto 中对应平台配方脚本 sha256 的前 16 位，配方一改就是新资产。"
+          gh release upload "$tag" "$RUNNER_TEMP/$asset" --repo "$GITHUB_REPOSITORY" --clobber
+          echo "::warning::已发布 $asset"
+
+      - name: 没编完的说明
+        # 让「这一轮没编完」在摘要里显性化。不说的话看到的是一个绿灯 job 和一个没变的 release，
+        # 很容易以为发布成功了。
+        if: steps.want.outputs.go == 'true' && steps.qt.outputs.complete != 'true'
+        shell: bash
+        run: |
+          echo "::warning::${{ matrix.target }} 这一轮没编完（断点进度已进缓存）——再手动跑一次本 workflow 接着编"
