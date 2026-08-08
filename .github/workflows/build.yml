@@ -18,6 +18,14 @@ name: Build static Qt
 #   于是「边编边被取消」= 每轮都白烧、进度一次也存不下来。反复手动跑，直到出资产为止。
 
 on:
+  # ★ 只在**本文件自己**被改动时触发。理由有两条：
+  #   · 配方或本 workflow 一变，原有资产就该重编（资产名里的哈希也会跟着变）；
+  #   · 但改 README 之类不该烧掉五个长 job，所以用 paths 卡死。
+  #   平时要补编（比如 Windows 断点续编的后续几轮），到 Actions 里点 Run workflow。
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build.yml'
   workflow_dispatch:
     inputs:
       qt-version:
