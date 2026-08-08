@@ -131,7 +131,13 @@ jobs:
       - name: Publish
         # 只在**这一轮真的编完**时发布。半份 Qt 传上去比没有更糟：下游会当成好东西下下来，
         # 然后在链接期以一堆缺符号收场 —— 而那时错因离现场已经隔了好几层。
-        if: steps.want.outputs.go == 'true' && steps.qt.outputs.complete == 'true'
+        #
+        # ★ prebuilt == 'true' 时跳过：这一轮根本没编，产物就是从本仓库自己的 release 下下来的，
+        #   再打包重传只会得到一个内容相同、字节不同（tar 记时间戳）的包，sha256 变了，
+        #   等于让所有下游平白重下几百 MB。
+        if: >-
+          steps.want.outputs.go == 'true' && steps.qt.outputs.complete == 'true'
+          && steps.qt.outputs.prebuilt != 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -141,16 +147,25 @@ jobs:
         run: |
           set -euo pipefail
           asset="qtstatic-${QTVER}-${{ matrix.target }}-${RECIPE}.tar.gz"
+          # ★ 路径先转 POSIX 再交给 tar。Windows runner 上 RUNNER_TEMP 是 D:\a\_temp，
+          #   GNU tar 按 `host:path` 的老规矩（冒号在第一个斜杠之前）判定这是**远程归档**，
+          #   于是去连接名为 D 的主机：
+          #       tar (child): Cannot connect to D: resolve failed
+          #       tar: D\:\\a\\_temp/qtstatic-….tar.gz: Cannot write: Broken pipe
+          #   --force-local 能治，但那是 GNU 独有的 flag，macOS 的 bsdtar 见了直接报错，
+          #   而这一步五套共用 —— 所以改路径。
+          out="$RUNNER_TEMP/$asset"
+          if command -v cygpath >/dev/null 2>&1; then out="$(cygpath -u "$RUNNER_TEMP")/$asset"; fi
           # -C "$QT_ROOT" . ：打包前缀的**内容**（含 .qtstatic-complete 这类点文件），
           # 解包端 tar -xzf 直接铺进前缀，不多一层目录。
-          tar -czf "$RUNNER_TEMP/$asset" -C "$QT_ROOT" .
-          ls -lh "$RUNNER_TEMP/$asset"
+          tar -czf "$out" -C "$QT_ROOT" .
+          ls -lh "$out"
           tag="qt-${QTVER}"
           gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
             || gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
                  --title "Prebuilt static Qt $QTVER" \
                  --notes "由本仓库的 Build static Qt 自动发布。资产名里的短哈希 = clashauto 中对应平台配方脚本 sha256 的前 16 位，配方一改就是新资产。"
-          gh release upload "$tag" "$RUNNER_TEMP/$asset" --repo "$GITHUB_REPOSITORY" --clobber
+          gh release upload "$tag" "$out" --repo "$GITHUB_REPOSITORY" --clobber
           echo "::warning::已发布 $asset"
 
       - name: 没编完的说明
