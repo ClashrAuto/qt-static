@@ -5,7 +5,8 @@ name: Build static Qt
 # 注：2026-08-08 clashauto 的静态 Qt 改动合入 master 之前，本 workflow 拉到的是旧版 action
 # （没有 complete 输出、Windows 脚本也没有 Ninja 修复）。表现极具迷惑性：三套 Qt 都**编译成功**、
 # job 全绿，但 Publish 一律 skipped —— 因为 `steps.qt.outputs.complete` 在旧 action 里根本不存在，
-# 空值 != 'true'。白编了一整轮。ref 指向 master 时要记得：master 上的 action 才是实际执行的那份。
+# 空值 != 'true'。白编了一整轮。实际执行的是 checkout 下来那个 ref 上的 action —— 现在是
+# Coast 的 main（配方镜像，见下文），clashauto 那边改了配方要先重跑生成器推到 Coast 才算数。
 #
 # ★ 为什么构建放在这边、而不是 clashauto 那边：
 #   反过来做（clashauto 编好再跨仓库写过来）需要一个对本仓库有 contents:write 的 PAT，
@@ -14,9 +15,17 @@ name: Build static Qt
 #   clashauto 那边只匿名下载公开资产，同样不需要凭据。
 #
 # ★ 配方（模块集、configure flag、断点续编逻辑）**只有一份**，在 clashauto 里：
-#   .github/actions/qt-static/。本仓库 checkout 过去直接 uses: 那个复合 action，
-#   不保存任何副本 —— 两份配方迟早会漂移，而漂移的表现是「编出来的 Qt 和 app 期待的不一致」，
-#   那种问题查起来极贵。
+#   .github/actions/qt-static/。本仓库不保存任何副本 —— 两份配方迟早会漂移，而漂移的表现是
+#   「编出来的 Qt 和 app 期待的不一致」，那种问题查起来极贵。
+#
+# ★★ 但**不再直接 checkout clashauto**（2026-09-28 改）。clashauto 2026-08 转了私有，
+#    这里用自带的 GITHUB_TOKEN 去 checkout 恒挂 `repository … not found`，定时任务从
+#    08-17 起每周红一次。给这里配一个能读 clashauto 的 PAT 就违背了上面「不需要任何
+#    PAT / secret」那条，于是反过来：clashauto 的 gen_coast_workflow.py 把配方**逐字节**
+#    镜像进公开的 ClashrAuto/Coast（与 Coast 的两个 workflow 同一次生成、同一道门禁
+#    generated_files_check.py），这里 checkout Coast、uses 那份镜像。
+#    逐字节是硬要求：资产名里的短哈希按 $GITHUB_ACTION_PATH 下的配方脚本（去 CR）算，
+#    镜像与源一个字节不差，哈希就与 clashauto 那侧下载时要找的名字一致。
 #
 # ★ Windows 两套一轮编不完 GitHub 的 6 小时上限，靠断点续编分几轮推进（进度存 Actions 缓存）。
 #   本 workflow **故意不设并发组**：被后一次运行取消掉的 job 跑不到回写缓存那一步，
@@ -96,14 +105,15 @@ jobs:
             *)                          echo "go=false" >> "$GITHUB_OUTPUT"; echo "跳过 ${{ matrix.target }}";;
           esac
 
-      - name: Checkout clashauto（配方的唯一来源）
+      - name: Checkout Coast（配方的公开镜像，源在 clashauto）
         if: steps.want.outputs.go == 'true'
         uses: actions/checkout@v4
         with:
-          repository: ClashrAuto/clashauto
-          ref: master
-          path: clashauto
-          # 公开仓库，不需要 token
+          repository: ClashrAuto/Coast
+          ref: main
+          path: coast
+          # 公开仓库，不需要 token。★ 别改回 checkout clashauto —— 那边是私有仓库，
+          #   见文件头「不再直接 checkout clashauto」那段。
 
       # 宿主 Qt 那一步没了：windows-arm64 交叉编译要的同版本宿主 Qt 由 qt-static action
       # 自己解析（取同版本同配方的 windows-x64 静态 Qt，也就是本仓库发的那个资产）。
@@ -118,7 +128,7 @@ jobs:
       - name: Build static Qt
         id: qt
         if: steps.want.outputs.go == 'true'
-        uses: ./clashauto/.github/actions/qt-static
+        uses: ./coast/.github/actions/qt-static
         with:
           qt-version: ${{ github.event.inputs.qt-version || matrix.qt }}
           target: ${{ matrix.target }}
